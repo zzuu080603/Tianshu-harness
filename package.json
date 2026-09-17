@@ -65,6 +65,7 @@
     "tokens:audit": "tsx scripts/analyze-output-tokens.ts",
     "diagnose:orphans": "tsx scripts/diagnose-tool-orphans.ts",
     "benchmark": "tsx scripts/run-benchmark.ts",
+    "prompt:bench": "tsx scripts/prompt-request-benchmark.ts",
     "smoke:mcp": "tsx scripts/smoke-mcp-presets.ts",
     "docs:index": "tsx scripts/docs-index.ts",
     "docs:check": "tsx scripts/docs-index.ts --check"
