@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   buildEquivalenceCorpus,
+  canonicalizeHostBytes,
   observeBranches,
   runCase,
   runEquivalenceSuite,
@@ -16,9 +17,27 @@ import {
  *
  * `engine-cache-stability.test.ts` guards same-version drift; this file guards
  * *across* versions: the 300 seeded cases are hashed against a fixture captured
- * from the frozen base commit. Any optimization of the five scans / token
- * estimate / divergence probe that moves a single byte fails here before it can
- * break every session's prefix cache.
+ * from a frozen engine revision (see `generatedFrom` in the fixture; the factory
+ * is byte-identical from the frozen base commit to this branch). Any optimization
+ * of the five scans / token estimate / divergence probe that moves a single byte
+ * fails here before it can break every session's prefix cache.
+ *
+ * The host-derived volatile regions are canonicalized out of the hash input by the
+ * harness, so the fixture is host-independent: the `<environment platform=… os=… />`
+ * attributes (the first CI run failed 300/300 cases on the runner's kernel release
+ * while passing on the authoring host) and the Windows-only `<path-style-note>` /
+ * `<shell-note>` / `<platform-note>` elements (absent on linux/darwin, present when
+ * the host is win32 — a win32 simulation drifted 300/300 before the strip). The
+ * host-independence of the canonicalizer itself is asserted below, so a regression
+ * of that property fails on CI instead of only on a Windows machine.
+ *
+ * Known deviation from the work order (Issue #2 §四 双通道防假绿): the second,
+ * real-session-log replay channel is not implemented — this environment has no
+ * real conversation logs (only test-generated session dirs under `~/.rivet`), and
+ * a test reading the user's session store would be non-hermetic. The explicit
+ * shape matrix plus the branch-reachability assertions in this file cover the
+ * same false-green concern hermetically; real-log replay stays a maintainer-side
+ * follow-up (a fixture captured from a real log would slot into the same corpus).
  *
  * Regenerate the fixture deliberately (only when prompt bytes are intentionally
  * changed) with:
@@ -71,6 +90,44 @@ describe('buildOaiRequest cross-version byte equivalence', () => {
     }
     assert.deepEqual(mismatches, [], `byte-equivalence gate failed:\n${mismatches.slice(0, 10).join('\n')}`)
     assert.equal(results.length, Object.keys(golden.cases).length, 'golden case count must match the corpus')
+    // Host-byte canonicalization must actually fire: a stale regex would silently
+    // re-bind the fixture to one machine's kernel/platform and fail in CI again.
+    assert.deepEqual(
+      results.filter(r => r.hostTags === 0).map(r => r.id),
+      [],
+      'every case must carry at least one canonicalized <environment> tag',
+    )
+    // The offset is the one breadcrumb field that cannot be hashed host-independently
+    // (it sums message lengths that embed the <environment> element), so its
+    // contract is checked relationally against live bytes instead of by hash.
+    assert.deepEqual(
+      results.filter(r => !r.divergenceOffsetsBounded).map(r => r.id),
+      [],
+      'divergence breadcrumb offsets must lie inside the request (0/negative/past-the-end = broken probe)',
+    )
+  })
+
+  it('canonicalizes every host shape to one byte string (linux/darwin/win32)', () => {
+    // Simulates the serialized request of the three host shapes the fixture is
+    // hashed on. The win32 shape carries the two extra volatile elements the
+    // engine emits only there, plus a foreign-kernel `os` attribute — the exact
+    // bytes that drifted 300/300 cases on a win32 host before they were stripped.
+    const shapes = [
+      '<environment platform=\\"linux\\" cwd=\\"/x\\" os=\\"Linux 6.18.48\\" />\\n\\n<sober>s</sober>',
+      '<environment platform=\\"darwin\\" cwd=\\"/x\\" os=\\"Darwin 23.6.0\\" />\\n\\n<sober>s</sober>',
+      '<environment platform=\\"win32\\" cwd=\\"/x\\" os=\\"Windows_NT 10.0.22631\\" />\\n\\n' +
+        '<path-style-note>backslash guidance</path-style-note>\\n\\n<shell-note>use git bash</shell-note>\\n\\n<sober>s</sober>',
+      '<environment platform=\\"linux\\" host=\\"win32\\" cwd=\\"/x\\" os=\\"Windows_NT 10.0.19045\\" />\\n\\n' +
+        '<platform-note>foreign target</platform-note>\\n\\n<sober>s</sober>',
+    ]
+    const canonical = shapes.map(s => canonicalizeHostBytes(s))
+    const expected = '<environment platform=\\"<host>\\" cwd=\\"/x\\" os=\\"<host>\\" />\\n\\n<sober>s</sober>'
+    assert.deepEqual(
+      canonical.map(c => c.bytes),
+      [expected, expected, expected, expected],
+      'every host shape must canonicalize to the same host-independent bytes, with non-host content intact',
+    )
+    assert.deepEqual(canonical.map(c => c.hostTags), [1, 1, 1, 1], 'each shape must report its <environment> tag')
   })
 
   it('is deterministic across fresh engines within a process', () => {

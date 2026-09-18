@@ -38,7 +38,11 @@ function emitGolden(): void {
   const golden = {
     note:
       'buildOaiRequest cross-version byte-equivalence fixture. Generated from the ' +
-      'engine at generatedFrom; regenerate only when a byte change is intentional: ' +
+      'engine at generatedFrom; host-derived bytes are canonicalized out before hashing ' +
+      '(<environment platform/os> attributes plus the win32-only <path-style-note>/' +
+      '<shell-note>/<platform-note> elements — see canonicalizeHostBytes), so the ' +
+      'fixture is machine-independent across linux/darwin/win32. Regenerate only when a ' +
+      'byte change is intentional: ' +
       'npx tsx scripts/prompt-request-benchmark.ts --emit-golden',
     generatedFrom: headSha(),
     cases,

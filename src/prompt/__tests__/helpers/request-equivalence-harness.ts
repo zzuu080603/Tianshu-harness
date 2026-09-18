@@ -15,7 +15,7 @@
  * observation masking, and a harness that misses a branch is a false green.
  */
 import { createHash } from 'node:crypto'
-import { PromptEngine } from '../../engine.js'
+import { PromptEngine, type PrefixDivergence } from '../../engine.js'
 import { stableStringify } from '../../../api/stable-json.js'
 import type { OaiContentPart, OaiMessage } from '../../../api/oai-types.js'
 
@@ -325,6 +325,56 @@ export function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+/**
+ * The host-derived byte regions of the built request have to be canonicalized,
+ * because the fixture is a *cross-version* byte gate that is hashed on every
+ * machine (author laptop, CI runner, Windows dev box). All of them live in the
+ * frozen volatile block and are selected by `process.platform` / `os.type()` /
+ * `os.release()` (see `src/platform.ts::getTargetPlatform` and
+ * `src/prompt/volatile.ts`):
+ *
+ *  1. `<environment platform=… cwd=… os=… />` — `platform` comes from
+ *     `process.platform`, `os` from `os.type()`/`os.release()`. The kernel
+ *     release alone differs between the authoring host and the ubuntu runner,
+ *     which made the first CI run of this gate fail with all 300 cases drifting
+ *     while it passed locally.
+ *  2. `<platform-note>` (target platform ≠ host platform),
+ *     `<path-style-note>` (target platform is win32) and `<shell-note>`
+ *     (resolved shell ≠ `sh`) are emitted *only* on some hosts — on a Windows
+ *     host the built request carries two elements a Linux host does not, which
+ *     drifted all 300 cases again on a win32 simulation.
+ *
+ * Pinning/removing exactly those regions keeps the golden host-independent
+ * without weakening anything else: message order/bytes, the five pass rewrites,
+ * dedup, masking, disk truncation, appendix and collapse all stay verbatim
+ * under the hash. `cwd` is preserved (corpus-controlled, not host-derived) and a
+ * re-pinned `platform` is still a pinned string, so a shape that stops carrying
+ * the element is reported by `hostTags` instead of silently passing. The three
+ * note bodies are static literals whose own bytes are covered by
+ * `src/prompt/__tests__/volatile.test.ts` (`windowsShellNote`, path-style-note
+ * presence); they are dropped here because their mere presence is host-shaped.
+ */
+const HOST_ENV_TAG = /<environment platform=\\"[^"\\]*\\"(?: host=\\"[^"\\]*\\")? cwd=\\"([^"\\]*)\\" os=\\"[^"\\]*\\" \/>/g
+// The leading `\n\n` separator is consumed with the element: the volatile block joins
+// its parts with it, so dropping only the element would leave a host-shaped blank run.
+const HOST_ONLY_BLOCK = /(?:\\n\\n)?<(platform-note|path-style-note|shell-note)>[\s\S]*?<\/\1>/g
+
+export interface CanonicalBytes {
+  bytes: string
+  /** How many `<environment … />` tags were canonicalized (0 = regex went stale). */
+  hostTags: number
+}
+
+/** Canonicalize the host-derived `<environment>` attributes before hashing. */
+export function canonicalizeHostBytes(serialized: string): CanonicalBytes {
+  let hostTags = 0
+  const withPinnedEnv = serialized.replace(HOST_ENV_TAG, (_match: string, cwd: string) => {
+    hostTags++
+    return `<environment platform=\\"<host>\\" cwd=\\"${cwd}\\" os=\\"<host>\\" />`
+  })
+  return { bytes: withPinnedEnv.replace(HOST_ONLY_BLOCK, ''), hostTags }
+}
+
 export interface CaseResult {
   id: string
   shape: string
@@ -334,6 +384,37 @@ export interface CaseResult {
   messagesHash: string
   /** Engine-side observable side effects over a two-build sequence. */
   sideEffectHash: string
+  /** Host-derived `<environment>` tags canonicalized out of the hash input. */
+  hostTags: number
+  /** Host-independent sanity check on the (unhashed) numeric part of the
+   *  divergence breadcrumbs — see {@link divergenceBreadcrumb}. */
+  divergenceOffsetsBounded: boolean
+}
+
+/**
+ * The divergence breadcrumb without its absolute character offset.
+ *
+ * `approxCharPos` sums the engine's own message lengths, and those lengths embed
+ * the host-derived `<environment>` element (kernel/platform strings differ per
+ * machine). Hashing the raw number would re-bind this fixture to the machine that
+ * generated it — the exact class of the round-1 CI failure, where the runner's
+ * kernel release made 300/300 cases drift while the test passed locally.
+ *
+ * What gate 2 hashes is the breadcrumb's contract (which message diverged, in
+ * which direction, how many messages on each side); the offset stays verified
+ * through a relational bound computed from bytes of the same host
+ * (`divergenceOffsetsBounded`) — a 0, negative or past-the-end offset still
+ * fails the gate.
+ */
+function divergenceBreadcrumb(d: PrefixDivergence | null): Omit<PrefixDivergence, 'approxCharPos'> | null {
+  if (!d) return null
+  const { approxCharPos: _hostBound, ...breadcrumb } = d
+  return breadcrumb
+}
+
+function offsetBounded(d: PrefixDivergence | null, serializedLength: number): boolean {
+  if (!d) return true
+  return d.approxCharPos >= 0 && (d.idx === 0 || d.approxCharPos > 0) && d.approxCharPos < serializedLength
 }
 
 function makeEngine(): PromptEngine {
@@ -363,20 +444,28 @@ export function runCase(c: EquivalenceCase): CaseResult {
   const second = engine.buildOaiRequest(extended, undefined, c.contextWindow, { sidePath: c.sidePath, onOrphanRepair })
   const div2 = engine.consumePrefixDivergence()
 
+  const canonicalFirst = canonicalizeHostBytes(stableStringify(first))
+  const canonicalSecond = canonicalizeHostBytes(stableStringify(second))
   const sideEffects = {
-    div1,
-    div2,
+    div1: divergenceBreadcrumb(div1),
+    div2: divergenceBreadcrumb(div2),
     frozenAnchors: engine.getFrozenAnchorCount(),
-    secondRequest: sha256(stableStringify(second)),
+    secondRequest: sha256(canonicalSecond.bytes),
     repairs,
   }
 
   return {
     id: c.id,
     shape: c.shape,
-    requestHash: sha256(stableStringify(first)),
-    messagesHash: sha256(stableStringify(first.messages)),
-    sideEffectHash: sha256(stableStringify(sideEffects)),
+    requestHash: sha256(canonicalFirst.bytes),
+    messagesHash: sha256(canonicalizeHostBytes(stableStringify(first.messages)).bytes),
+    // Canonicalized too: `repairs` carries message bytes that include the
+    // host-derived <environment> element.
+    sideEffectHash: sha256(canonicalizeHostBytes(stableStringify(sideEffects)).bytes),
+    hostTags: canonicalFirst.hostTags,
+    divergenceOffsetsBounded:
+      offsetBounded(div1, stableStringify(first).length) &&
+      offsetBounded(div2, stableStringify(second).length),
   }
 }
 
