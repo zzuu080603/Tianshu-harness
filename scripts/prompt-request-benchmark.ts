@@ -31,9 +31,14 @@ function headSha(): string {
 
 function emitGolden(): void {
   const results = runEquivalenceSuite()
-  const cases: Record<string, { request: string; messages: string; sideEffects: string }> = {}
+  const cases: Record<string, { requestWire: string; requestStable: string; messages: string; sideEffects: string }> = {}
   for (const r of results) {
-    cases[r.id] = { request: r.requestHash, messages: r.messagesHash, sideEffects: r.sideEffectHash }
+    cases[r.id] = {
+      requestWire: r.requestWireHash,
+      requestStable: r.requestStableHash,
+      messages: r.messagesHash,
+      sideEffects: r.sideEffectHash,
+    }
   }
   const golden = {
     note:
@@ -41,7 +46,9 @@ function emitGolden(): void {
       'engine at generatedFrom; host-derived bytes are canonicalized out before hashing ' +
       '(<environment platform/os> attributes plus the win32-only <path-style-note>/' +
       '<shell-note>/<platform-note> elements — see canonicalizeHostBytes), so the ' +
-      'fixture is machine-independent across linux/darwin/win32. Regenerate only when a ' +
+      'fixture is machine-independent across linux/darwin/win32. The hard gate is ' +
+      'requestWire (JSON.stringify, the wire serialization the openai-client sends); ' +
+      'requestStable is sorted-key diagnosis granularity. Regenerate only when a ' +
       'byte change is intentional: ' +
       'npx tsx scripts/prompt-request-benchmark.ts --emit-golden',
     generatedFrom: headSha(),
