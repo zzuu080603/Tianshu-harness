@@ -6,9 +6,10 @@ import { runLatencyBenchmark, type BenchTier } from './helpers/request-equivalen
  * End-to-end latency sanity for `buildOaiRequest` (Issue #2 / upstream #139).
  *
  * `engine-perf.test.ts` pins the sub-passes' O(n) data structures, not the
- * assembled request. This test records median-of-5 wall-clock numbers for
+ * assembled request. This test records median-of-7 wall-clock numbers for
  * growing histories so a catastrophic regression (an accidental O(n²) in any
  * of the five scans) shows up as either a failure or a PR-reviewable table.
+ * Seven samples per the acceptance line in upstream #142.
  *
  * Wall-clock assertions are deliberately generous — CI machines vary, and a
  * flaky perf test is worse than no perf test. The real byte gate lives in
@@ -22,11 +23,14 @@ const TIERS: BenchTier[] = [
   { turns: 100, payloadChars: 100_000, contextWindow: 200_000 },
 ]
 
-const CAP_MS = 3_000
+// Measured p50 on CI-class hardware is single-digit ms for the heaviest tier;
+// 200ms leaves two orders of magnitude of headroom while still catching the
+// accidental-O(n²) class (2ms → 200ms+) that a 3000ms cap would wave through.
+const CAP_MS = 200
 
-describe('buildOaiRequest end-to-end latency (median of 5)', () => {
+describe('buildOaiRequest end-to-end latency (median of 7)', () => {
   it('builds growing histories within a generous cap', () => {
-    const rows = runLatencyBenchmark(TIERS, 5)
+    const rows = runLatencyBenchmark(TIERS, 7)
     console.log('| turns | payload chars | window | P50 ms |')
     console.log('|---:|---:|---:|---:|')
     for (const r of rows) {

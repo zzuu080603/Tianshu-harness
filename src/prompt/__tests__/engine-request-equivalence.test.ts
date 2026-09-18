@@ -45,7 +45,10 @@ import {
  */
 
 interface GoldenCase {
-  request: string
+  /** sha256(JSON.stringify(request)) — the hard gate, wire-identical bytes. */
+  requestWire: string
+  /** sha256(stableStringify(request)) — sorted-key diagnosis granularity. */
+  requestStable: string
   messages: string
   sideEffects: string
 }
@@ -84,7 +87,11 @@ describe('buildOaiRequest cross-version byte equivalence', () => {
     for (const r of results) {
       const g = golden.cases[r.id]
       if (!g) { mismatches.push(`${r.id}: missing from golden`); continue }
-      if (g.request !== r.requestHash) mismatches.push(`${label(r)}: request hash drifted`)
+      // The WIRE hash is the gate: JSON.stringify insertion order is what
+      // `openai-client` sends, and what the prefix cache sees. A sorted-key
+      // hash would stay green through an insertion-order regression.
+      if (g.requestWire !== r.requestWireHash) mismatches.push(`${label(r)}: wire request hash drifted`)
+      if (g.requestStable !== r.requestStableHash) mismatches.push(`${label(r)}: sorted-key request hash drifted`)
       if (g.messages !== r.messagesHash) mismatches.push(`${label(r)}: messages hash drifted`)
       if (g.sideEffects !== r.sideEffectHash) mismatches.push(`${label(r)}: side-effect hash drifted`)
     }
@@ -132,29 +139,33 @@ describe('buildOaiRequest cross-version byte equivalence', () => {
 
   it('is deterministic across fresh engines within a process', () => {
     const corpus = buildEquivalenceCorpus()
-    // Sample the corpus: two full suite runs already run in the golden test; a
+    // Sample the corpus: the full suite already runs in the golden test; a
     // 30-case sample across shapes keeps this cheap while still catching
     // engine-global state (caches, registries) leaking between builds.
     const sample = corpus.filter((_, i) => i % 10 === 0)
     for (const c of sample) {
       const a = runCase(c)
       const b = runCase(c)
-      assert.equal(a.requestHash, b.requestHash, `${c.id}: fresh-engine bytes must be identical`)
+      assert.equal(a.requestWireHash, b.requestWireHash, `${c.id}: fresh-engine wire bytes must be identical`)
       assert.equal(a.sideEffectHash, b.sideEffectHash, `${c.id}: fresh-engine side effects must be identical`)
     }
   })
 
-  it('sidePath builds stay hermetic for every side-path case', () => {
+  it('sidePath builds stay hermetic on the same engine (main → side → main)', () => {
+    // The poisoning accident this guards (engine.ts, 2026-07-05) is a
+    // side-path build leaking a state write into the NEXT main rebuild on the
+    // SAME engine — invisible across fresh engines by construction. runCase
+    // runs the main → side → main sequence for every sidePath case: the
+    // post-side main bytes are hashed into the golden (postSideMainRequest)
+    // and the relational flag asserts byte-identity here.
     const sidePathCases = buildEquivalenceCorpus().filter(c => c.sidePath)
     assert.ok(sidePathCases.length > 0, 'corpus must include sidePath cases')
-    for (const c of sidePathCases) {
-      const r = runCase(c)
-      assert.equal(
-        r.sideEffectHash,
-        runCase(c).sideEffectHash,
-        `${c.id}: side-path build must not poison engine state`,
-      )
-    }
+    const results = sidePathCases.map(runCase)
+    assert.deepEqual(
+      results.filter(r => r.sidePathHermetic !== true).map(r => r.id),
+      [],
+      'side-path build must not change the next main-turn request bytes',
+    )
   })
 
   it('the corpus still reaches every guarded pass (no false green)', () => {
@@ -167,8 +178,8 @@ describe('buildOaiRequest cross-version byte equivalence', () => {
       'unicode',
       'visionParts',
       'systemReminder',
-      'largeWindow',
-      'sidePath',
+      'dedupHint',
+      'toolsSchema',
       'orphanRepaired',
       'collapseStrippedReasoning',
     ] as const) {

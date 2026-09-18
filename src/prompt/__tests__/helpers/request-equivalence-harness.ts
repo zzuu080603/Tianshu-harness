@@ -17,6 +17,7 @@
 import { createHash } from 'node:crypto'
 import { PromptEngine, type PrefixDivergence } from '../../engine.js'
 import { stableStringify } from '../../../api/stable-json.js'
+import type { ToolHistoryEntry } from '../../volatile.js'
 import type { OaiContentPart, OaiMessage } from '../../../api/oai-types.js'
 
 export type Rng = () => number
@@ -83,6 +84,38 @@ const TOOL_ARGS: Record<string, (rng: Rng, i: number) => string> = {
   write_file: (_r, i) => JSON.stringify({ file_path: `src/out${i}.ts` }),
   edit_file: (_r, i) => JSON.stringify({ file_path: `src/edit${i}.ts` }),
   repo_map: (r, i) => JSON.stringify({ query: `${pick(r, WORDS)}${i}` }),
+}
+
+/** Non-empty static tool schemas: the tools array is a first-class cache face
+ *  (the engine fingerprints it separately and `openai-client` hashes the wire
+ *  form), so the tool shapes must exercise it instead of freezing an
+ *  always-empty `request.tools`. Format = the engine's flat ToolDefinition;
+ *  the OAI function-wrapper shape is the engine's job at build time. */
+export const TOOL_SCHEMAS = TOOL_NAMES.map((name) => ({
+  name,
+  description: `deterministic ${name} tool schema for the equivalence corpus`,
+  input_schema: {
+    type: 'object' as const,
+    properties: { path: { type: 'string', description: 'repo-relative path' } },
+    required: ['path'],
+  },
+}))
+
+/** Shapes whose runs carry a deterministic toolHistory — the second
+ *  buildOaiRequest argument. Every real turn has one (the volatile read-file
+ *  dedup hint renders from it), so the corpus must not leave it undefined. */
+export const TOOL_HISTORY_SHAPES = new Set(['tool-batch', 'dedup-hit-miss', 'orphan-repair'])
+
+export function buildToolHistory(seed: number): ToolHistoryEntry[] {
+  const entries: ToolHistoryEntry[] = []
+  for (let i = 0; i < 9; i++) {
+    entries.push({
+      tool: i % 3 === 2 ? 'grep' : 'read_file',
+      target: `src/file${seed * 10 + i}.ts`,
+      status: i === 7 ? 'failed' : 'success',
+    })
+  }
+  return entries
 }
 
 function assistantToolCalls(rng: Rng, i: number, count: number): OaiMessage {
@@ -378,17 +411,28 @@ export function canonicalizeHostBytes(serialized: string): CanonicalBytes {
 export interface CaseResult {
   id: string
   shape: string
-  /** sha256(stableStringify(request)) — the hard byte gate. */
-  requestHash: string
+  /** sha256(JSON.stringify(request)) — THE hard byte gate: the same
+   *  serialization the wire path sends (`openai-client`: body =
+   *  JSON.stringify(effectiveBody), insertion order included). A sorted-key
+   *  hash would stay green through an insertion-order regression that still
+   *  breaks every session's prefix cache. */
+  requestWireHash: string
+  /** sha256(stableStringify(request)) — sorted-key diagnosis granularity. */
+  requestStableHash: string
   /** sha256(stableStringify(request.messages)) — diagnosis granularity. */
   messagesHash: string
-  /** Engine-side observable side effects over a two-build sequence. */
+  /** Engine-side observable side effects over the build sequence. */
   sideEffectHash: string
   /** Host-derived `<environment>` tags canonicalized out of the hash input. */
   hostTags: number
   /** Host-independent sanity check on the (unhashed) numeric part of the
    *  divergence breadcrumbs — see {@link divergenceBreadcrumb}. */
   divergenceOffsetsBounded: boolean
+  /** sidePath cases only: main → sidePath → main on ONE engine — true when
+   *  the post-side main build is byte-identical to the pre-side one (the
+   *  2026-07-05 hermeticity contract). The post-side bytes themselves are
+   *  pinned in the golden via sideEffects.postSideMainRequest. */
+  sidePathHermetic?: boolean
 }
 
 /**
@@ -417,11 +461,11 @@ function offsetBounded(d: PrefixDivergence | null, serializedLength: number): bo
   return d.approxCharPos >= 0 && (d.idx === 0 || d.approxCharPos > 0) && d.approxCharPos < serializedLength
 }
 
-function makeEngine(): PromptEngine {
+function makeEngine(c?: { shape: string }): PromptEngine {
   return new PromptEngine({
     model: 'test-model',
     maxTokens: 4096,
-    staticCtx: { tools: [] },
+    staticCtx: { tools: c && TOOL_HISTORY_SHAPES.has(c.shape) ? TOOL_SCHEMAS : [] },
     volatileCtx: { cwd: '/test/project', rivetMd: '# Test Project' },
   })
 }
@@ -433,20 +477,23 @@ function makeEngine(): PromptEngine {
  * an optimization that emits identical bytes once but corrupts engine state.
  */
 export function runCase(c: EquivalenceCase): CaseResult {
-  const engine = makeEngine()
+  const engine = makeEngine(c)
   const repairs: Array<{ count: number; messages: OaiMessage[] }> = []
   const onOrphanRepair = (messages: OaiMessage[], count: number): void => { repairs.push({ count, messages }) }
+  const history = TOOL_HISTORY_SHAPES.has(c.shape) ? buildToolHistory(c.seed) : undefined
 
-  const first = engine.buildOaiRequest(c.messages, undefined, c.contextWindow, { sidePath: c.sidePath, onOrphanRepair })
+  const first = engine.buildOaiRequest(c.messages, history, c.contextWindow, { sidePath: c.sidePath, onOrphanRepair })
   const div1 = engine.consumePrefixDivergence()
 
   const extended = [...c.messages, { role: 'assistant' as const, content: 'extension' }]
-  const second = engine.buildOaiRequest(extended, undefined, c.contextWindow, { sidePath: c.sidePath, onOrphanRepair })
+  const second = engine.buildOaiRequest(extended, history, c.contextWindow, { sidePath: c.sidePath, onOrphanRepair })
   const div2 = engine.consumePrefixDivergence()
 
-  const canonicalFirst = canonicalizeHostBytes(stableStringify(first))
-  const canonicalSecond = canonicalizeHostBytes(stableStringify(second))
-  const sideEffects = {
+  // THE hard gate hashes the wire serialization (insertion order included):
+  // JSON.stringify is exactly what `openai-client` sends as the request body.
+  const canonicalFirstWire = canonicalizeHostBytes(JSON.stringify(first))
+  const canonicalSecond = canonicalizeHostBytes(JSON.stringify(second))
+  const sideEffects: Record<string, unknown> = {
     div1: divergenceBreadcrumb(div1),
     div2: divergenceBreadcrumb(div2),
     frozenAnchors: engine.getFrozenAnchorCount(),
@@ -454,18 +501,50 @@ export function runCase(c: EquivalenceCase): CaseResult {
     repairs,
   }
 
+  // sidePath cases: a controlled A/B experiment. Engine A never runs a
+  // side build; engine B runs the identical main sequence with ONE side
+  // build inserted. Both second-main builds have the same history and the
+  // same fresh-engine starting state, so the ONLY possible byte difference
+  // is the side build's state leak — the 2026-07-05 prefix-divergence
+  // finding. Per-engine natural evolution cancels out; on a hermetic
+  // engine the two second-main hashes are identical, and both are pinned
+  // in the golden.
+  let sidePathHermetic: boolean | undefined
+  if (c.sidePath) {
+    const control = makeEngine(c)
+    control.buildOaiRequest(c.messages, history, c.contextWindow, { onOrphanRepair })
+    void control.consumePrefixDivergence()
+    const controlSecond = control.buildOaiRequest(extended, history, c.contextWindow, { onOrphanRepair })
+    void control.consumePrefixDivergence()
+
+    const side = engine.buildOaiRequest(c.messages, undefined, c.contextWindow, { sidePath: true, onOrphanRepair })
+    const divSide = engine.consumePrefixDivergence()
+    const postSide = engine.buildOaiRequest(extended, history, c.contextWindow, { onOrphanRepair })
+    const divPost = engine.consumePrefixDivergence()
+
+    sideEffects.controlSecondMainRequest = sha256(canonicalizeHostBytes(JSON.stringify(controlSecond)).bytes)
+    sideEffects.sideRequest = sha256(canonicalizeHostBytes(JSON.stringify(side)).bytes)
+    sideEffects.postSideMainRequest = sha256(canonicalizeHostBytes(JSON.stringify(postSide)).bytes)
+    sideEffects.divSide = divergenceBreadcrumb(divSide)
+    sideEffects.divPost = divergenceBreadcrumb(divPost)
+    sidePathHermetic =
+      canonicalizeHostBytes(JSON.stringify(postSide)).bytes === canonicalizeHostBytes(JSON.stringify(controlSecond)).bytes
+  }
+
   return {
     id: c.id,
     shape: c.shape,
-    requestHash: sha256(canonicalFirst.bytes),
+    requestWireHash: sha256(canonicalFirstWire.bytes),
+    requestStableHash: sha256(canonicalizeHostBytes(stableStringify(first)).bytes),
     messagesHash: sha256(canonicalizeHostBytes(stableStringify(first.messages)).bytes),
     // Canonicalized too: `repairs` carries message bytes that include the
     // host-derived <environment> element.
     sideEffectHash: sha256(canonicalizeHostBytes(stableStringify(sideEffects)).bytes),
-    hostTags: canonicalFirst.hostTags,
+    hostTags: canonicalFirstWire.hostTags,
     divergenceOffsetsBounded:
-      offsetBounded(div1, stableStringify(first).length) &&
-      offsetBounded(div2, stableStringify(second).length),
+      offsetBounded(div1, JSON.stringify(first).length) &&
+      offsetBounded(div2, JSON.stringify(second).length),
+    sidePathHermetic,
   }
 }
 
@@ -486,16 +565,19 @@ export interface BranchSignals {
   unicode: boolean
   visionParts: boolean
   systemReminder: boolean
-  largeWindow: boolean
-  sidePath: boolean
+  /** The volatile read-file dedup hint rendered from toolHistory. */
+  dedupHint: boolean
+  /** The static tools schema reached request.tools. */
+  toolsSchema: boolean
   orphanRepaired: boolean
   collapseStrippedReasoning: boolean
 }
 
 export function observeBranches(c: EquivalenceCase): BranchSignals {
-  const engine = makeEngine()
+  const engine = makeEngine(c)
   const repairs: number[] = []
-  const req = engine.buildOaiRequest(c.messages, undefined, c.contextWindow, {
+  const history = TOOL_HISTORY_SHAPES.has(c.shape) ? buildToolHistory(c.seed) : undefined
+  const req = engine.buildOaiRequest(c.messages, history, c.contextWindow, {
     sidePath: c.sidePath,
     onOrphanRepair: (_m, count) => { repairs.push(count) },
   })
@@ -513,8 +595,8 @@ export function observeBranches(c: EquivalenceCase): BranchSignals {
     unicode: body.includes('\\u0000') || body.includes('𝕏𝕐') || body.includes('\\ud800'),
     visionParts: req.messages.some(m => Array.isArray(m.content)),
     systemReminder: body.includes('<system-reminder>'),
-    largeWindow: (c.contextWindow ?? 0) >= 200_000,
-    sidePath: c.sidePath === true,
+    dedupHint: body.includes('<read-file-dedup-hint>'),
+    toolsSchema: Array.isArray(req.tools) && req.tools.length > 0,
     orphanRepaired: repairs.length > 0,
     collapseStrippedReasoning: inputAssistantWithReasoning > outputAssistantWithReasoning,
   }
